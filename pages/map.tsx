@@ -4,10 +4,11 @@ import Head from 'next/head';
 type Customer = {
   name: string;
   address: string;
+  addressSource: 'custom'|'default'; // 'default' = on utilise l'adresse principale (non confirmée)
+  lastOrderAt: string | null;
+  wholesale: boolean; // validé si true
   lat?: number;
   lng?: number;
-  lastOrderAt?: string | null;
-  wholesale?: string | null;
   dist?: number;
 };
 
@@ -21,19 +22,55 @@ function haversineKm(a:{lat:number;lng:number}, b:{lat:number;lng:number}){
   return 2*R*Math.asin(Math.sqrt(s));
 }
 
-function statusColor(c: Customer): {stroke:string; fill:string; label:string} {
-  const grey = { stroke: '#6b7280', fill: '#9ca3af', label: 'Pas de commande depuis + de 2 ans' };
-  const yellow = { stroke: '#b45309', fill: '#facc15', label: 'En attente de validation' };
-  const red = { stroke: '#991b1b', fill: '#ef4444', label: 'Actif' };
+function isInactive(lastOrderAt: string | null): boolean {
+  const twoYearsAgo = new Date();
+  twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
+  return !lastOrderAt || new Date(lastOrderAt) < twoYearsAgo;
+}
 
-  // Priorité: gris (inactif) > jaune (wholesale vide) > rouge
-  const twoYearsAgo = new Date(); twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
-  const last = c.lastOrderAt ? new Date(c.lastOrderAt) : null;
-  const inactive = !last || last < twoYearsAgo;
+/** Crée un DivIcon Leaflet avec styles:
+ * - validé + adresse par défaut -> ORANGE plein
+ * - non validé + adresse par défaut -> BICOLORE ORANGE+GRIS (moitié-moitié)
+ * - adresse confirmée (custom) -> ROUGE
+ * - si inactif (>2 ans): on ajoute un HALO gris
+ */
+function makeIcon(L:any, opts: {
+  usingDefault: boolean;
+  validated: boolean;
+  inactive: boolean;
+}) {
+  const size = 18;
+  let bg = '#ef4444'; // rouge par défaut (adresse confirmée)
+  let gradient = '';
 
-  if (inactive) return grey;
-  if (!c.wholesale || String(c.wholesale).trim() === '') return yellow;
-  return red;
+  if (opts.usingDefault) {
+    if (opts.validated) {
+      // orange plein
+      bg = '#f59e0b';
+    } else {
+      // bicolore orange + gris
+      gradient = 'linear-gradient(90deg, #f59e0b 50%, #9ca3af 50%)';
+      bg = 'transparent';
+    }
+  }
+
+  const halo = opts.inactive ? '0 0 0 3px #9ca3af' : '0 0 0 0 transparent';
+
+  const html =
+    `<div style="
+      width:${size}px;height:${size}px;border-radius:50%;
+      background:${bg};
+      ${gradient ? `background:${gradient};` : ''}
+      border:1px solid rgba(0,0,0,0.35);
+      box-shadow:${halo};
+    "></div>`;
+
+  return L.divIcon({
+    html,
+    className: 'reseller-pin',
+    iconSize: [size, size],
+    iconAnchor: [size/2, size/2]
+  });
 }
 
 export default function MapPage(){
@@ -44,24 +81,26 @@ export default function MapPage(){
   const [nearby,setNearby] = useState<Customer[]>([]);
   const mapRef = useRef<any>(null);
   const circleRef = useRef<any>(null);
+  const markersRef = useRef<any[]>([]);
 
   // init map
   useEffect(()=>{
     if (typeof window === 'undefined') return;
     const L = require('leaflet');
-    const m = L.map('map').setView([48.8566, 2.3522], 6);
+    const m = L.map('map').setView([48.8566, 2.3522], 5);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(m);
     mapRef.current = m;
     return ()=> m.remove();
   },[]);
 
-  // load customers + geocode server
+  // load customers + batch geocode server
   useEffect(()=>{
     (async ()=>{
       const key = new URLSearchParams(window.location.search).get('key') || '';
       const r = await fetch(`/api/customers?key=${encodeURIComponent(key)}`);
       if (!r.ok) { setLoading(false); return; }
       const base = await r.json() as Customer[];
+
       const addresses = base.map(b => b.address);
       const g = await fetch(`/api/geocode?key=${encodeURIComponent(key)}`, {
         method:'POST', headers:{'Content-Type':'application/json'},
@@ -77,22 +116,32 @@ export default function MapPage(){
     })();
   },[]);
 
-  // draw markers with colors
+  // draw markers with our icon rules
   useEffect(()=>{
-    if (!mapRef.current || !customers.length) return;
+    if (!mapRef.current) return;
+
+    // clear old
+    markersRef.current.forEach(m => m.remove());
+    markersRef.current = [];
+
+    if (!customers.length) return;
     const L = require('leaflet');
+
     customers.forEach(c => {
-      const color = statusColor(c);
-      const marker = L.circleMarker([c.lat!, c.lng!], {
-        radius: 8, color: color.stroke, weight: 1,
-        fillColor: color.fill, fillOpacity: 0.95
+      const icon = makeIcon(L, {
+        usingDefault: c.addressSource === 'default',
+        validated: !!c.wholesale,
+        inactive: isInactive(c.lastOrderAt)
       });
+      const marker = L.marker([c.lat!, c.lng!], { icon });
       marker.bindPopup(
-        `<b>${c.name}</b><br>${c.address}` +
-        (c.lastOrderAt ? `<br>Dernière commande : ${new Date(c.lastOrderAt).toLocaleDateString()}` : `<br>Jamais commandé`) +
-        (c.wholesale ? '' : `<br><i>En attente de validation</i>`)
+        `<b>${c.name}</b><br>${c.address}`
+        + (c.lastOrderAt ? `<br>Dernière commande : ${new Date(c.lastOrderAt).toLocaleDateString()}` : `<br>Jamais commandé`)
+        + (c.addressSource === 'default' ? `<br><i>Adresse non confirmée (adresse principale Shopify)</i>` : '')
+        + (!c.wholesale ? `<br><i>Profil wholesale non validé</i>` : '')
       );
       marker.addTo(mapRef.current);
+      markersRef.current.push(marker);
     });
   },[customers]);
 
@@ -119,12 +168,13 @@ export default function MapPage(){
     setNearby(hits);
   }
 
-  // petite légende
+  // Légende : claire et conforme à ta demande
   const Legend = () => (
-    <div style={{display:'flex', gap:12, marginTop:6, fontSize:12}}>
-      <span><i style={{display:'inline-block',width:10,height:10,borderRadius:999,background:'#ef4444',border:'1px solid #991b1b',marginRight:6}}/>Actif</span>
-      <span><i style={{display:'inline-block',width:10,height:10,borderRadius:999,background:'#facc15',border:'1px solid #b45309',marginRight:6}}/>En attente de validation</span>
-      <span><i style={{display:'inline-block',width:10,height:10,borderRadius:999,background:'#9ca3af',border:'1px solid #6b7280',marginRight:6}}/>Pas de commande depuis + de 2 ans</span>
+    <div style={{display:'flex', gap:12, marginTop:6, fontSize:12, flexWrap:'wrap'}}>
+      <span><i style={{display:'inline-block',width:12,height:12,borderRadius:999,background:'#ef4444',border:'1px solid rgba(0,0,0,0.35)',marginRight:6}}/>Adresse confirmée (custom.address)</span>
+      <span><i style={{display:'inline-block',width:12,height:12,borderRadius:999,background:'#f59e0b',border:'1px solid rgba(0,0,0,0.35)',marginRight:6}}/>Validé — <b>Adresse non confirmée</b> (adresse principale)</span>
+      <span><i style={{display:'inline-block',width:12,height:12,borderRadius:999,background:'linear-gradient(90deg, #f59e0b 50%, #9ca3af 50%)',border:'1px solid rgba(0,0,0,0.35)',marginRight:6}}/>Non validé — <b>Adresse non confirmée</b> (adresse principale)</span>
+      <span><i style={{display:'inline-block',width:12,height:12,borderRadius:999,background:'#fff',border:'1px solid rgba(0,0,0,0.35)',boxShadow:'0 0 0 3px #9ca3af',marginRight:6}}/>Halo gris : pas de commande depuis + de 2 ans</span>
     </div>
   );
 
@@ -141,7 +191,7 @@ export default function MapPage(){
           <label>Rayon (km): <input type="number" min={0.1} step={0.1} value={radius} onChange={e=>setRadius(parseFloat(e.target.value))} style={{width:80, padding:6}}/></label>
           <button onClick={checkCandidate} style={{padding:'8px 12px'}}>Vérifier proximité</button>
         </div>
-        <div style={{marginTop:8, maxWidth:520}}>
+        <div style={{marginTop:8, maxWidth:560}}>
           {loading ? 'Chargement...' :
             (nearby.length
               ? (<div><b>{nearby.length} revendeur(s) dans {radius} km :</b><ul>{nearby.map((h,i)=>(<li key={i}>{h.dist!.toFixed(2)} km — <b>{h.name}</b> — {h.address}</li>))}</ul></div>)
