@@ -3,28 +3,18 @@ import Head from 'next/head';
 
 type Customer = {
   name: string;
-  address: string;                 // adresse finale (custom.address OU adresse principale)
+  address: string;                 // adresse finale (custom.address ou adresse par défaut)
   addressSource: 'custom' | 'default';
-  lastOrderAt: string | null;
-  wholesale: boolean;              // profil wholesale rempli ?
-  tags?: string[];                 // tags du client (optionnel)
+  lastOrderAt: string | null;      // ISO ou null
+  wholesale: string | boolean;     // “défini” = revendeur (peu importe la valeur)
+  businessType?: string | null;    // custom.business_type si dispo
   lat?: number;
   lng?: number;
 };
 
-// --------- utils ----------
-const DEFAULT_CENTER: [number, number] = [48.8566, 2.3522]; // Paris
-const CACHE_KEY = 'geoCache.v1'; // cache localStorage { [address]: {lat,lng} }
-
-function isInactive(lastOrderAt: string | null): boolean {
-  const twoYearsAgo = new Date();
-  twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
-  return !lastOrderAt || new Date(lastOrderAt) < twoYearsAgo;
-}
-
-function hasEverOrdered(lastOrderAt: string | null): boolean {
-  return !!lastOrderAt;
-}
+// ---------- Constantes & helpers ----------
+const DEFAULT_CENTER: [number, number] = [48.8566, 2.3522];
+const CACHE_KEY = 'geoCache.v1'; // localStorage
 
 function loadGeoCache(): Record<string, { lat: number; lng: number }> {
   if (typeof window === 'undefined') return {};
@@ -43,14 +33,62 @@ function saveGeoCache(cache: Record<string, { lat: number; lng: number }>) {
     localStorage.setItem(CACHE_KEY, JSON.stringify(cache));
   } catch {}
 }
+function clearGeoCache() {
+  if (typeof window === 'undefined') return;
+  localStorage.removeItem(CACHE_KEY);
+}
 
-// Leaflet icon (rouge pour tous les points)
-function makeRedIcon(L: any) {
+function daysSince(d: Date) {
+  const ms = Date.now() - d.getTime();
+  return Math.floor(ms / (1000 * 60 * 60 * 24));
+}
+
+type Activity = 'never' | 'recent' | 'stale' | 'normal';
+function classifyActivity(lastOrderAt: string | null): Activity {
+  if (!lastOrderAt) return 'never';
+  const d = new Date(lastOrderAt);
+  if (isNaN(d.getTime())) return 'never';
+  const dd = daysSince(d);
+  if (dd <= 90) return 'recent';
+  if (dd > 730) return 'stale'; // > 2 ans
+  return 'normal';
+}
+
+// Marqueurs:
+// - confirmed (custom) => disque rouge plein
+// - default          => anneau rouge (fond blanc)
+// Overlays:
+// - halo vert  => recent
+// - halo gris  => stale
+// - dot bleu   => never
+function makeIcon(L: any, opts: { confirmed: boolean; activity: Activity }) {
   const size = 18;
-  const html = `<div style="
+  const baseStyle =
+    opts.confirmed
+      ? `background:#ef4444;`
+      : `background:#ffffff;border:2px solid #ef4444;box-sizing:border-box;`;
+
+  // priorités halo: stale (gris) > recent (vert) > none
+  let halo = '';
+  if (opts.activity === 'stale') halo = '0 0 0 4px #9ca3af';
+  else if (opts.activity === 'recent') halo = '0 0 0 4px #22c55e';
+
+  const dot =
+    opts.activity === 'never'
+      ? `<div style="position:absolute;left:50%;top:50%;width:6px;height:6px;margin:-3px 0 0 -3px;border-radius:50%;background:#3b82f6;"></div>`
+      : '';
+
+  const html = `
+    <div style="
+      position:relative;
       width:${size}px;height:${size}px;border-radius:50%;
-      background:#ef4444;border:1px solid rgba(0,0,0,0.35);
-    "></div>`;
+      ${baseStyle}
+      border:1px solid rgba(0,0,0,.35);
+      box-shadow:${halo || 'none'};
+    ">
+      ${dot}
+    </div>`;
+
   return L.divIcon({
     html,
     className: 'reseller-pin',
@@ -59,28 +97,32 @@ function makeRedIcon(L: any) {
   });
 }
 
-// --------- composant ----------
+// ---------- Composant ----------
 export default function MapPage() {
   const [allCustomers, setAllCustomers] = useState<Customer[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // progression géocodage
+  // progression géocode
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [okCount, setOkCount] = useState(0);
   const [failCount, setFailCount] = useState(0);
   const [lastError, setLastError] = useState<string>('');
 
-  // filtres combinables
-  const [fHasOrdered, setFHasOrdered] = useState(false);
-  const [fInactive2y, setFInactive2y] = useState(false);
-  const [fTagWls, setFTagWls] = useState(false);
-  const [fWholesale, setFWholesale] = useState(false);
+  // filtres UI (ne relancent pas le géocode)
+  const [fRecent, setFRecent] = useState(true);     // < 90 j
+  const [fStale, setFStale] = useState(true);       // > 2 ans
+  const [fNever, setFNever] = useState(true);       // jamais
+  const [fNormal, setFNormal] = useState(true);     // entre 90j et 2 ans
 
-  // recherche adresse
-  const [search, setSearch] = useState('');
+  const [fConfirmed, setFConfirmed] = useState(true); // custom.address
+  const [fDefault, setFDefault] = useState(true);     // adresse par défaut
+
+  const [search, setSearch] = useState(''); // recadrage
 
   const mapRef = useRef<any>(null);
-  const markersRef = useRef<any[]>([]);
+  const markersRef = useRef<Array<{ marker: any; customer: Customer; activity: Activity; confirmed: boolean }>>(
+    []
+  );
 
   // init carte
   useEffect(() => {
@@ -92,77 +134,95 @@ export default function MapPage() {
     return () => m.remove();
   }, []);
 
-  // 1) Charger tous les clients
-  useEffect(() => {
-    (async () => {
+  // Charger revendeurs + garder seulement ceux qui ont wholesale défini + une adresse
+  async function fetchCustomers() {
+    setLoading(true);
+    setLastError('');
+    setProgress({ done: 0, total: 0 });
+    setOkCount(0);
+    setFailCount(0);
+
+    try {
       const key = new URLSearchParams(window.location.search).get('key') || '';
       const r = await fetch(`/api/customers?key=${encodeURIComponent(key)}`);
-      const base = await r.json().catch(() => null);
+      const base = await r.json();
 
-      if (!Array.isArray(base)) {
-        setLastError('Erreur /api/customers (réponse non JSON array)');
-        setLoading(false);
-        return;
-      }
+      if (!Array.isArray(base)) throw new Error('Réponse /api/customers invalide');
 
-      // on garde UNIQUEMENT ceux qui ont une adresse (CAS 3 exclus)
-      const usable: Customer[] = (base as Customer[]).filter(
-        (c) => typeof c.address === 'string' && c.address.trim().length > 0
-      );
+      // wholesale défini + adresse exploitable
+      const usable: Customer[] = (base as Customer[]).filter((c) => {
+        const wholesaleDefined = c.wholesale !== undefined && c.wholesale !== null && `${c.wholesale}` !== '';
+        const hasAddress = c.address && c.address.trim().length > 0;
+        return wholesaleDefined && hasAddress;
+      });
 
       setAllCustomers(usable);
+    } catch (e: any) {
+      setLastError(e?.message || 'Erreur inconnue');
+    } finally {
       setLoading(false);
-    })();
+    }
+  }
+
+  // Au premier chargement
+  useEffect(() => {
+    fetchCustomers();
   }, []);
 
-  // Liste filtrée selon les cases cochées — memo pour éviter recalculs inutiles
+  // Liste avec classification d’activité
+  const enriched = useMemo(() => {
+    return allCustomers.map((c) => ({
+      ...c,
+      activity: classifyActivity(c.lastOrderAt),
+      confirmed: c.addressSource === 'custom',
+    }));
+  }, [allCustomers]);
+
+  // Filtres (en mémoire uniquement)
   const filtered = useMemo(() => {
-    return allCustomers.filter((c) => {
-      if (fHasOrdered && !hasEverOrdered(c.lastOrderAt)) return false;
-      if (fInactive2y && !isInactive(c.lastOrderAt)) return false;
-      if (fWholesale && !c.wholesale) return false;
-      if (fTagWls) {
-        const tags = (c.tags || []).map((t) => String(t).toLowerCase());
-        if (!tags.includes('wls')) return false;
-      }
+    return enriched.filter((c) => {
+      // activité
+      if (!fRecent && c.activity === 'recent') return false;
+      if (!fStale && c.activity === 'stale') return false;
+      if (!fNever && c.activity === 'never') return false;
+      if (!fNormal && c.activity === 'normal') return false;
+      // source adresse
+      if (!fConfirmed && c.confirmed) return false;
+      if (!fDefault && !c.confirmed) return false;
       return true;
     });
-  }, [allCustomers, fHasOrdered, fInactive2y, fWholesale, fTagWls]);
+  }, [enriched, fRecent, fStale, fNever, fNormal, fConfirmed, fDefault]);
 
-  // 2) Géocodage (plus rapide) : cache localStorage + dédup + parallélisme limité (3)
+  // Géocodage (cache + dédup + parallélisme) puis création des markers (une seule fois par refresh/reload)
   useEffect(() => {
     if (!mapRef.current) return;
 
-    // clear markers
-    markersRef.current.forEach((m) => m.remove());
+    // clear anciens markers
+    markersRef.current.forEach((m) => m.marker.remove());
     markersRef.current = [];
 
-    if (!filtered.length) {
+    if (!enriched.length) {
       setProgress({ done: 0, total: 0 });
       return;
     }
 
     const L = require('leaflet');
-    const icon = makeRedIcon(L);
 
     let cancelled = false;
-
     (async () => {
       const key = new URLSearchParams(window.location.search).get('key') || '';
       const cache = loadGeoCache();
 
-      // adresses uniques
-      const uniqueAddrs = Array.from(new Set(filtered.map((c) => c.address.trim())));
-      setProgress({ done: 0, total: uniqueAddrs.length });
+      // adresses uniques à géocoder
+      const addrs = Array.from(new Set(enriched.map((c) => c.address.trim())));
+      setProgress({ done: 0, total: addrs.length });
       setOkCount(0);
       setFailCount(0);
       setLastError('');
 
-      // Petit helper pour une tâche de géocode
+      // fonction unité
       const geocodeOne = async (addr: string) => {
         if (cancelled) return null;
-
-        // cache local
         if (cache[addr]) return cache[addr];
 
         try {
@@ -171,15 +231,13 @@ export default function MapPage() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ address: addr }),
           });
-
           if (!g.ok) {
             setFailCount((v) => v + 1);
             setLastError(`geocode ${g.status} ${g.statusText}`);
             return null;
           }
           const c: any = await g.json().catch(() => null);
-          const ok =
-            c && typeof c.lat === 'number' && typeof c.lng === 'number' && !Number.isNaN(c.lat) && !Number.isNaN(c.lng);
+          const ok = c && typeof c.lat === 'number' && typeof c.lng === 'number' && !Number.isNaN(c.lat) && !Number.isNaN(c.lng);
           if (ok) {
             cache[addr] = { lat: c.lat, lng: c.lng };
             setOkCount((v) => v + 1);
@@ -195,59 +253,82 @@ export default function MapPage() {
           setLastError(`exception: ${e?.message || 'unknown'}`);
           return null;
         } finally {
-          // incrémente la barre de progression
-          setProgress((p) => ({ ...p, done: Math.min(p.done + 1, uniqueAddrs.length) }));
+          setProgress((p) => ({ ...p, done: Math.min(p.done + 1, addrs.length) }));
         }
       };
 
-      // Exécuter avec parallélisme limité
+      // parallélisme limité
       const CONCURRENCY = 3;
+      const idxRef = { i: 0 };
       const results: Record<string, { lat: number; lng: number } | null> = {};
-      let idx = 0;
 
       async function worker() {
-        while (!cancelled && idx < uniqueAddrs.length) {
-          const my = uniqueAddrs[idx++];
-          const res = await geocodeOne(my);
-          results[my] = res;
+        while (!cancelled && idxRef.i < addrs.length) {
+          const addr = addrs[idxRef.i++];
+          results[addr] = await geocodeOne(addr);
         }
       }
-      const workers = Array.from({ length: Math.min(CONCURRENCY, uniqueAddrs.length) }, worker);
+      const workers = Array.from({ length: Math.min(CONCURRENCY, addrs.length) }, worker);
       await Promise.all(workers);
-
       if (cancelled) return;
 
-      // dessiner tous les markers
-      for (const c of filtered) {
-        const addr = c.address.trim();
-        const pt = results[addr] || loadGeoCache()[addr]; // si job fini il est en cache
+      // Créer tous les markers une fois pour toutes (on filtrera par affichage ensuite)
+      for (const c of enriched) {
+        const pt = results[c.address.trim()] || loadGeoCache()[c.address.trim()];
         if (!pt) continue;
 
+        const icon = makeIcon(L, { confirmed: !!c.confirmed, activity: c.activity as Activity });
         const marker = L.marker([pt.lat, pt.lng], { icon });
 
         const lines: string[] = [];
         lines.push(`<b>${c.name}</b>`);
+        if (c.businessType) lines.push(`<span style="opacity:.8">Type : ${c.businessType}</span>`);
         lines.push(c.address);
-        lines.push(c.wholesale ? 'Profil wholesale : <b>rempli</b>' : 'Profil wholesale : <b>non rempli</b>');
         lines.push(
-          c.addressSource === 'custom'
-            ? '<i>Adresse de revente (custom.address)</i>'
-            : '<i>Adresse par défaut (Shopify)</i>'
+          c.confirmed
+            ? '<i>Adresse de magasin (custom.address)</i>'
+            : '<i>Adresse non confirmée (adresse par défaut)</i>'
         );
-        if (c.lastOrderAt) lines.push(`Dernière commande : ${new Date(c.lastOrderAt).toLocaleDateString()}`);
+        if (c.lastOrderAt) {
+          const d = new Date(c.lastOrderAt);
+          lines.push(`Dernière commande : ${isNaN(d.getTime()) ? '-' : d.toLocaleDateString()}`);
+        } else {
+          lines.push(`Jamais commandé`);
+        }
+        lines.push(`Wholesale : <code>${String(c.wholesale)}</code>`);
+        // lien Google Maps
+        const mapsQ = encodeURIComponent(c.address);
+        lines.push(`<a target="_blank" rel="noreferrer" href="https://www.google.com/maps/search/?api=1&query=${mapsQ}">Ouvrir dans Google Maps</a>`);
 
         marker.bindPopup(lines.join('<br/>'));
         marker.addTo(mapRef.current);
-        markersRef.current.push(marker);
+        markersRef.current.push({ marker, customer: c, activity: c.activity as Activity, confirmed: !!c.confirmed });
       }
     })();
 
-    return () => {
-      cancelled = true;
-    };
-  }, [filtered]);
+    return () => { cancelled = true; };
+  }, [enriched]);
 
-  // recherche d’adresse (recentrage)
+  // Appliquer les filtres sans régéocoder (on montre/masque les markers existants)
+  useEffect(() => {
+    if (!mapRef.current) return;
+    for (const item of markersRef.current) {
+      const a = item.activity;
+      const showActivity =
+        (a === 'recent' && fRecent) ||
+        (a === 'stale' && fStale) ||
+        (a === 'never' && fNever) ||
+        (a === 'normal' && fNormal);
+
+      const showSource = (item.confirmed && fConfirmed) || (!item.confirmed && fDefault);
+
+      const visible = showActivity && showSource;
+      const el = (item.marker as any)?._icon as HTMLElement | undefined;
+      if (el) el.style.display = visible ? 'block' : 'none';
+    }
+  }, [fRecent, fStale, fNever, fNormal, fConfirmed, fDefault]);
+
+  // Recherche d’adresse (recentrage)
   async function searchAddress() {
     const key = new URLSearchParams(window.location.search).get('key') || '';
     const q = search.trim();
@@ -270,6 +351,14 @@ export default function MapPage() {
     mapRef.current.setView([pt.lat, pt.lng], 13);
   }
 
+  // Rechargement manuel: purge le cache + relance la récup/géocode/markers
+  async function manualReload() {
+    clearGeoCache();
+    markersRef.current.forEach((m) => m.marker.remove());
+    markersRef.current = [];
+    await fetchCustomers();
+  }
+
   // UI
   return (
     <>
@@ -288,100 +377,105 @@ export default function MapPage() {
           padding: 12,
           borderRadius: 8,
           boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
-          maxWidth: 860,
+          maxWidth: 900,
         }}
       >
-        {/* Recherche */}
+        {/* Ligne recherche + reload */}
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
           <input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Rechercher une adresse…"
+            placeholder="Rechercher / centrer une adresse…"
             style={{ padding: 8, width: 360 }}
           />
           <button onClick={searchAddress} style={{ padding: '8px 12px' }}>
             Rechercher
           </button>
+          <button onClick={manualReload} style={{ padding: '8px 12px' }}>
+            Recharger les données
+          </button>
         </div>
 
-        {/* Filtres combinables */}
-        <div style={{ marginTop: 10, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-          <label>
-            <input
-              type="checkbox"
-              checked={fHasOrdered}
-              onChange={(e) => setFHasOrdered(e.target.checked)}
-            />{' '}
-            A déjà commandé
-          </label>
-          <label>
-            <input
-              type="checkbox"
-              checked={fInactive2y}
-              onChange={(e) => setFInactive2y(e.target.checked)}
-            />{' '}
-            N'a pas passé commande depuis + de 2 ans
-          </label>
-          <label>
-            <input type="checkbox" checked={fTagWls} onChange={(e) => setFTagWls(e.target.checked)} /> A
-            le tag <code>wls</code>
-          </label>
-          <label>
-            <input
-              type="checkbox"
-              checked={fWholesale}
-              onChange={(e) => setFWholesale(e.target.checked)}
-            />{' '}
-            Wholesale profile rempli
-          </label>
-        </div>
-
-        {/* Statut / progression */}
-        <div style={{ marginTop: 10, fontSize: 14 }}>
-          {loading
-            ? `Chargement des clients…`
-            : `Clients filtrés: ${filtered.length} / ${allCustomers.length}`}
-          {progress.total > 0 && (
-            <>
-              <div style={{ marginTop: 6, width: 340, height: 6, background: '#eee', borderRadius: 4 }}>
-                <div
-                  style={{
-                    width: `${
-                      progress.total ? Math.round((progress.done / progress.total) * 100) : 0
-                    }%`,
-                    height: '100%',
-                    borderRadius: 4,
-                    background: '#60a5fa',
-                  }}
-                />
-              </div>
-              <div style={{ marginTop: 6, fontSize: 12, color: '#444' }}>
-                Géocode OK: <b>{okCount}</b> — Échecs: <b>{failCount}</b>{' '}
-                {lastError && <span style={{ color: '#b91c1c' }}>• Dernière erreur : {lastError}</span>}
-              </div>
-            </>
-          )}
-          {progress.total === 0 && !loading && filtered.length > 0 && (
-            <div style={{ marginTop: 6, fontSize: 12, color: '#444' }}>
-              <i>Tout est déjà en cache — affichage direct.</i>
+        {/* Légende & filtres */}
+        <div style={{ marginTop: 10 }}>
+          <div style={{ marginBottom: 8, lineHeight: 1.8 }}>
+            <div>
+              <span style={{
+                display:'inline-block', width:14, height:14, borderRadius:999,
+                background:'#ef4444', border:'1px solid rgba(0,0,0,.35)', marginRight:6
+              }} />
+              Adresse confirmée (<code>custom.address</code>)
+              <input type="checkbox" checked={fConfirmed} onChange={e=>setFConfirmed(e.target.checked)} style={{marginLeft:8}} />
             </div>
-          )}
-        </div>
+            <div>
+              <span style={{
+                display:'inline-block', width:14, height:14, borderRadius:999,
+                background:'#fff', border:'2px solid #ef4444', boxSizing:'border-box',
+                marginRight:6
+              }} />
+              Adresse non confirmée (adresse par défaut)
+              <input type="checkbox" checked={fDefault} onChange={e=>setFDefault(e.target.checked)} style={{marginLeft:8}} />
+            </div>
+            <div>
+              <span style={{
+                display:'inline-block', width:14, height:14, borderRadius:999,
+                background:'#ef4444', border:'1px solid rgba(0,0,0,.35)', marginRight:6,
+                boxShadow:'0 0 0 4px #22c55e'
+              }} />
+              Commande <b>dans les 90 jours</b> (halo vert)
+              <input type="checkbox" checked={fRecent} onChange={e=>setFRecent(e.target.checked)} style={{marginLeft:8}} />
+            </div>
+            <div>
+              <span style={{
+                display:'inline-block', width:14, height:14, borderRadius:999,
+                background:'#ef4444', border:'1px solid rgba(0,0,0,.35)', marginRight:6,
+                boxShadow:'0 0 0 4px #9ca3af'
+              }} />
+              <b>Inactif &gt; 2 ans</b> (halo gris)
+              <input type="checkbox" checked={fStale} onChange={e=>setFStale(e.target.checked)} style={{marginLeft:8}} />
+            </div>
+            <div>
+              <span style={{position:'relative', display:'inline-block', width:14, height:14, borderRadius:999,
+                background:'#ef4444', border:'1px solid rgba(0,0,0,.35)', marginRight:6}}>
+                <span style={{position:'absolute', left:'50%', top:'50%', width:6, height:6, marginLeft:-3, marginTop:-3, borderRadius:999, background:'#3b82f6'}} />
+              </span>
+              <b>Jamais commandé</b> (point bleu)
+              <input type="checkbox" checked={fNever} onChange={e=>setFNever(e.target.checked)} style={{marginLeft:8}} />
+            </div>
+            <div>
+              <span style={{
+                display:'inline-block', width:14, height:14, borderRadius:999,
+                background:'#ef4444', border:'1px solid rgba(0,0,0,.35)', marginRight:6
+              }} />
+              Autres (entre 90 j et 2 ans)
+              <input type="checkbox" checked={fNormal} onChange={e=>setFNormal(e.target.checked)} style={{marginLeft:8}} />
+            </div>
+          </div>
 
-        {/* Légende simple : tous les points sont rouges */}
-        <div style={{ marginTop: 8, fontSize: 13 }}>
-          <span
-            style={{
-              display: 'inline-block',
-              width: 12,
-              height: 12,
-              borderRadius: 999,
-              background: '#ef4444',
-              border: '1px solid rgba(0,0,0,0.35)',
-              marginRight: 6,
-            }}
-          />
-          <b>Points</b> : adresse de revente <i>(custom.address)</i> si présente, sinon adresse principale.
+          <div style={{ fontSize: 13, color: '#444' }}>
+            {loading
+              ? 'Chargement des revendeurs…'
+              : `Revendeurs: ${enriched.length} | Affichés (selon filtres): ${filtered.length}`}
+            {progress.total > 0 && (
+              <>
+                <div style={{ marginTop: 6, width: 360, height: 6, background: '#eee', borderRadius: 4 }}>
+                  <div
+                    style={{
+                      width: `${progress.total ? Math.round((progress.done / progress.total) * 100) : 0}%`,
+                      height: '100%', borderRadius: 4, background: '#60a5fa'
+                    }}
+                  />
+                </div>
+                <div style={{ marginTop: 6, fontSize: 12 }}>
+                  Géocode OK: <b>{okCount}</b> — Échecs: <b>{failCount}</b>
+                  {lastError && <span style={{ color: '#b91c1c' }}> • Dernière erreur: {lastError}</span>}
+                </div>
+                <div style={{ marginTop: 4, fontSize: 12, opacity: .8 }}>
+                  Astuce: après le premier chargement, c’est instantané grâce au cache local.
+                </div>
+              </>
+            )}
+          </div>
         </div>
       </div>
 
