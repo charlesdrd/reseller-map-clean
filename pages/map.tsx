@@ -76,6 +76,7 @@ function makeIcon(L:any, opts: {
 export default function MapPage(){
   const [customers,setCustomers] = useState<Customer[]>([]);
   const [loading,setLoading] = useState(true);
+  const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [radius,setRadius] = useState(DEFAULT_RADIUS_KM);
   const [candidate,setCandidate] = useState('');
   const [nearby,setNearby] = useState<Customer[]>([]);
@@ -93,26 +94,47 @@ export default function MapPage(){
     return ()=> m.remove();
   },[]);
 
-  // load customers + batch geocode server
+  // load customers + geocode 1-by-1 (évite les timeouts)
   useEffect(()=>{
     (async ()=>{
       const key = new URLSearchParams(window.location.search).get('key') || '';
+
+      // 1) charge les clients
       const r = await fetch(`/api/customers?key=${encodeURIComponent(key)}`);
       if (!r.ok) { setLoading(false); return; }
       const base = await r.json() as Customer[];
 
-      const addresses = base.map(b => b.address);
-      const g = await fetch(`/api/geocode?key=${encodeURIComponent(key)}`, {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ addresses })
-      });
-      const coords = await g.json() as {address:string,lat:number,lng:number}[];
-      const merged = base.map(b=>{
-        const m = coords.find(c=> c.address === b.address);
-        return m ? { ...b, lat:m.lat, lng:m.lng } : b;
-      }).filter(b => typeof b.lat === 'number' && typeof b.lng === 'number');
-      setCustomers(merged);
-      setLoading(false);
+      setProgress({ done: 0, total: base.length });
+
+      // 2) géocode 1 par 1 (avec pause ~1.1s pour OpenCage)
+      for (let i = 0; i < base.length; i++) {
+        const b = base[i];
+
+        try {
+          const g = await fetch(`/api/geocode?key=${encodeURIComponent(key)}`, {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ address: b.address })
+          });
+
+          if (g.ok) {
+            const c = await g.json() as { address:string; lat:number; lng:number };
+            setCustomers(prev => {
+              const byKey = new Map(prev.map(p => [`${p.name}|${p.address}`, p]));
+              byKey.set(`${b.name}|${b.address}`, { ...b, lat:c.lat, lng:c.lng });
+              return Array.from(byKey.values());
+            });
+          }
+        } catch { /* on continue */ }
+
+        setProgress({ done: i + 1, total: base.length });
+
+        // montre dès le 1er point
+        if (i === 0) setLoading(false);
+
+        // respecte la limite OpenCage (~1 req/s)
+        await new Promise(r => setTimeout(r, 1100));
+      }
     })();
   },[]);
 
@@ -149,11 +171,10 @@ export default function MapPage(){
     const key = new URLSearchParams(window.location.search).get('key') || '';
     const r = await fetch(`/api/geocode?key=${encodeURIComponent(key)}`, {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ addresses: [candidate] })
+      body: JSON.stringify({ address: candidate })
     });
-    const j = await r.json();
-    const pt = j?.[0];
-    if (!pt) { alert('Adresse introuvable'); return; }
+    if (!r.ok) { alert('Adresse introuvable'); return; }
+    const pt = await r.json() as { lat:number; lng:number };
 
     const L = require('leaflet');
     if (circleRef.current) { circleRef.current.remove(); circleRef.current = null; }
@@ -168,7 +189,7 @@ export default function MapPage(){
     setNearby(hits);
   }
 
-  // Légende : claire et conforme à ta demande
+  // Légende
   const Legend = () => (
     <div style={{display:'flex', gap:12, marginTop:6, fontSize:12, flexWrap:'wrap'}}>
       <span><i style={{display:'inline-block',width:12,height:12,borderRadius:999,background:'#ef4444',border:'1px solid rgba(0,0,0,0.35)',marginRight:6}}/>Adresse confirmée (custom.address)</span>
@@ -191,14 +212,27 @@ export default function MapPage(){
           <label>Rayon (km): <input type="number" min={0.1} step={0.1} value={radius} onChange={e=>setRadius(parseFloat(e.target.value))} style={{width:80, padding:6}}/></label>
           <button onClick={checkCandidate} style={{padding:'8px 12px'}}>Vérifier proximité</button>
         </div>
+
         <div style={{marginTop:8, maxWidth:560}}>
-          {loading ? 'Chargement...' :
-            (nearby.length
-              ? (<div><b>{nearby.length} revendeur(s) dans {radius} km :</b><ul>{nearby.map((h,i)=>(<li key={i}>{h.dist!.toFixed(2)} km — <b>{h.name}</b> — {h.address}</li>))}</ul></div>)
-              : 'Aucun revendeur proche pour l’instant.'
-            )
+          {loading
+            ? `Chargement… (${progress.done}/${progress.total})`
+            : (nearby.length
+                ? (<div><b>{nearby.length} revendeur(s) dans {radius} km :</b>
+                    <ul>{nearby.map((h,i)=>(<li key={i}>{h.dist!.toFixed(2)} km — <b>{h.name}</b> — {h.address}</li>))}</ul>
+                  </div>)
+                : 'Aucun revendeur proche pour l’instant.'
+              )
           }
+          {progress.total > 0 && (
+            <div style={{marginTop:6, width:280, height:6, background:'#eee', borderRadius:4}}>
+              <div style={{
+                width: `${progress.total ? Math.round((progress.done/progress.total)*100) : 0}%`,
+                height:'100%', borderRadius:4, background:'#60a5fa'
+              }}/>
+            </div>
+          )}
         </div>
+
         <Legend />
       </div>
 
