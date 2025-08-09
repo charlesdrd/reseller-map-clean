@@ -6,7 +6,7 @@ type Customer = {
   address: string;                 // adresse finale (custom.address ou adresse par défaut)
   addressSource: 'custom' | 'default';
   lastOrderAt: string | null;      // ISO ou null
-  wholesale: string | boolean;     // “défini” = revendeur (peu importe la valeur)
+  wholesale: string | boolean;     // “défini” = revendeur
   businessType?: string | null;    // custom.business_type si dispo
   lat?: number;
   lng?: number;
@@ -54,19 +54,19 @@ function classifyActivity(lastOrderAt: string | null): Activity {
   return 'normal';
 }
 
-// Marqueurs:
-// - confirmed (custom) => disque rouge plein
-// - default          => anneau rouge (fond blanc)
+// Icônes:
+// - confirmed (custom) => disque ROUGE PLEIN (#e11d48)
+// - default (adresse Shopify) => disque ROSE CLAIR (#fde2e2) + contour rouge (plus de blanc ambigu)
 // Overlays:
-// - halo vert  => recent
-// - halo gris  => stale
-// - dot bleu   => never
+// - halo vert  => recent (<90j)
+// - halo gris  => stale (>2 ans)
+// - dot bleu   => never (jamais)
 function makeIcon(L: any, opts: { confirmed: boolean; activity: Activity }) {
   const size = 18;
-  const baseStyle =
-    opts.confirmed
-      ? `background:#ef4444;`
-      : `background:#ffffff;border:2px solid #ef4444;box-sizing:border-box;`;
+
+  const baseStyle = opts.confirmed
+    ? `background:#e11d48;` // rouge plein
+    : `background:#fde2e2;border:2px solid #e11d48;box-sizing:border-box;`; // rouge pâle + contour rouge
 
   // priorités halo: stale (gris) > recent (vert) > none
   let halo = '';
@@ -112,7 +112,7 @@ export default function MapPage() {
   const [fRecent, setFRecent] = useState(true);     // < 90 j
   const [fStale, setFStale] = useState(true);       // > 2 ans
   const [fNever, setFNever] = useState(true);       // jamais
-  const [fNormal, setFNormal] = useState(true);     // entre 90j et 2 ans
+  const [fNormal, setFNormal] = useState(true);     // 90 j → 2 ans
 
   const [fConfirmed, setFConfirmed] = useState(true); // custom.address
   const [fDefault, setFDefault] = useState(true);     // adresse par défaut
@@ -134,7 +134,7 @@ export default function MapPage() {
     return () => m.remove();
   }, []);
 
-  // Charger revendeurs + garder seulement ceux qui ont wholesale défini + une adresse
+  // Charger revendeurs + garder seulement ceux avec wholesale défini + une adresse
   async function fetchCustomers() {
     setLoading(true);
     setLastError('');
@@ -149,7 +149,6 @@ export default function MapPage() {
 
       if (!Array.isArray(base)) throw new Error('Réponse /api/customers invalide');
 
-      // wholesale défini + adresse exploitable
       const usable: Customer[] = (base as Customer[]).filter((c) => {
         const wholesaleDefined = c.wholesale !== undefined && c.wholesale !== null && `${c.wholesale}` !== '';
         const hasAddress = c.address && c.address.trim().length > 0;
@@ -169,7 +168,7 @@ export default function MapPage() {
     fetchCustomers();
   }, []);
 
-  // Liste avec classification d’activité
+  // Enrichi avec activité + confirmed
   const enriched = useMemo(() => {
     return allCustomers.map((c) => ({
       ...c,
@@ -178,7 +177,7 @@ export default function MapPage() {
     }));
   }, [allCustomers]);
 
-  // Filtres (en mémoire uniquement)
+  // Filtres (mémoire uniquement)
   const filtered = useMemo(() => {
     return enriched.filter((c) => {
       // activité
@@ -193,7 +192,7 @@ export default function MapPage() {
     });
   }, [enriched, fRecent, fStale, fNever, fNormal, fConfirmed, fDefault]);
 
-  // Géocodage (cache + dédup + parallélisme) puis création des markers (une seule fois par refresh/reload)
+  // Géocodage (cache + dédup + parallélisme) puis création des markers
   useEffect(() => {
     if (!mapRef.current) return;
 
@@ -272,7 +271,7 @@ export default function MapPage() {
       await Promise.all(workers);
       if (cancelled) return;
 
-      // Créer tous les markers une fois pour toutes (on filtrera par affichage ensuite)
+      // Créer tous les markers (on filtrera ensuite côté DOM)
       for (const c of enriched) {
         const pt = results[c.address.trim()] || loadGeoCache()[c.address.trim()];
         if (!pt) continue;
@@ -296,7 +295,6 @@ export default function MapPage() {
           lines.push(`Jamais commandé`);
         }
         lines.push(`Wholesale : <code>${String(c.wholesale)}</code>`);
-        // lien Google Maps
         const mapsQ = encodeURIComponent(c.address);
         lines.push(`<a target="_blank" rel="noreferrer" href="https://www.google.com/maps/search/?api=1&query=${mapsQ}">Ouvrir dans Google Maps</a>`);
 
@@ -377,10 +375,10 @@ export default function MapPage() {
           padding: 12,
           borderRadius: 8,
           boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
-          maxWidth: 900,
+          maxWidth: 920,
         }}
       >
-        {/* Ligne recherche + reload */}
+        {/* Recherche + reload */}
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
           <input
             value={search}
@@ -396,86 +394,105 @@ export default function MapPage() {
           </button>
         </div>
 
-        {/* Légende & filtres */}
-        <div style={{ marginTop: 10 }}>
-          <div style={{ marginBottom: 8, lineHeight: 1.8 }}>
-            <div>
-              <span style={{
-                display:'inline-block', width:14, height:14, borderRadius:999,
-                background:'#ef4444', border:'1px solid rgba(0,0,0,.35)', marginRight:6
-              }} />
-              Adresse confirmée (<code>custom.address</code>)
-              <input type="checkbox" checked={fConfirmed} onChange={e=>setFConfirmed(e.target.checked)} style={{marginLeft:8}} />
-            </div>
-            <div>
-              <span style={{
-                display:'inline-block', width:14, height:14, borderRadius:999,
-                background:'#fff', border:'2px solid #ef4444', boxSizing:'border-box',
-                marginRight:6
-              }} />
-              Adresse non confirmée (adresse par défaut)
-              <input type="checkbox" checked={fDefault} onChange={e=>setFDefault(e.target.checked)} style={{marginLeft:8}} />
-            </div>
-            <div>
-              <span style={{
-                display:'inline-block', width:14, height:14, borderRadius:999,
-                background:'#ef4444', border:'1px solid rgba(0,0,0,.35)', marginRight:6,
-                boxShadow:'0 0 0 4px #22c55e'
-              }} />
-              Commande <b>dans les 90 jours</b> (halo vert)
-              <input type="checkbox" checked={fRecent} onChange={e=>setFRecent(e.target.checked)} style={{marginLeft:8}} />
-            </div>
-            <div>
-              <span style={{
-                display:'inline-block', width:14, height:14, borderRadius:999,
-                background:'#ef4444', border:'1px solid rgba(0,0,0,.35)', marginRight:6,
-                boxShadow:'0 0 0 4px #9ca3af'
-              }} />
-              <b>Inactif &gt; 2 ans</b> (halo gris)
-              <input type="checkbox" checked={fStale} onChange={e=>setFStale(e.target.checked)} style={{marginLeft:8}} />
-            </div>
-            <div>
-              <span style={{position:'relative', display:'inline-block', width:14, height:14, borderRadius:999,
-                background:'#ef4444', border:'1px solid rgba(0,0,0,.35)', marginRight:6}}>
-                <span style={{position:'absolute', left:'50%', top:'50%', width:6, height:6, marginLeft:-3, marginTop:-3, borderRadius:999, background:'#3b82f6'}} />
-              </span>
-              <b>Jamais commandé</b> (point bleu)
-              <input type="checkbox" checked={fNever} onChange={e=>setFNever(e.target.checked)} style={{marginLeft:8}} />
-            </div>
-            <div>
-              <span style={{
-                display:'inline-block', width:14, height:14, borderRadius:999,
-                background:'#ef4444', border:'1px solid rgba(0,0,0,.35)', marginRight:6
-              }} />
-              Autres (entre 90 j et 2 ans)
-              <input type="checkbox" checked={fNormal} onChange={e=>setFNormal(e.target.checked)} style={{marginLeft:8}} />
+        {/* Légende claire, en 2 sections */}
+        <div style={{ marginTop: 12, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+          {/* Adresse */}
+          <div>
+            <div style={{ fontWeight: 600, marginBottom: 6 }}>Adresse</div>
+
+            <div style={{ lineHeight: 1.8 }}>
+              <div>
+                <span style={{
+                  display:'inline-block', width:14, height:14, borderRadius:999,
+                  background:'#e11d48', border:'1px solid rgba(0,0,0,.35)', marginRight:6
+                }} />
+                Confirmée (<code>custom.address</code>)
+                <input type="checkbox" checked={fConfirmed} onChange={e=>setFConfirmed(e.target.checked)} style={{marginLeft:8}} />
+              </div>
+
+              <div>
+                <span style={{
+                  display:'inline-block', width:14, height:14, borderRadius:999,
+                  background:'#fde2e2', border:'2px solid #e11d48', boxSizing:'border-box',
+                  marginRight:6
+                }} />
+                Non confirmée (adresse par défaut)
+                <input type="checkbox" checked={fDefault} onChange={e=>setFDefault(e.target.checked)} style={{marginLeft:8}} />
+              </div>
             </div>
           </div>
 
-          <div style={{ fontSize: 13, color: '#444' }}>
-            {loading
-              ? 'Chargement des revendeurs…'
-              : `Revendeurs: ${enriched.length} | Affichés (selon filtres): ${filtered.length}`}
-            {progress.total > 0 && (
-              <>
-                <div style={{ marginTop: 6, width: 360, height: 6, background: '#eee', borderRadius: 4 }}>
-                  <div
-                    style={{
-                      width: `${progress.total ? Math.round((progress.done / progress.total) * 100) : 0}%`,
-                      height: '100%', borderRadius: 4, background: '#60a5fa'
-                    }}
-                  />
-                </div>
-                <div style={{ marginTop: 6, fontSize: 12 }}>
-                  Géocode OK: <b>{okCount}</b> — Échecs: <b>{failCount}</b>
-                  {lastError && <span style={{ color: '#b91c1c' }}> • Dernière erreur: {lastError}</span>}
-                </div>
-                <div style={{ marginTop: 4, fontSize: 12, opacity: .8 }}>
-                  Astuce: après le premier chargement, c’est instantané grâce au cache local.
-                </div>
-              </>
-            )}
+          {/* Activité */}
+          <div>
+            <div style={{ fontWeight: 600, marginBottom: 6 }}>Activité</div>
+
+            <div style={{ lineHeight: 1.8 }}>
+              <div>
+                <span style={{
+                  display:'inline-block', width:14, height:14, borderRadius:999,
+                  background:'#e11d48', border:'1px solid rgba(0,0,0,.35)', marginRight:6,
+                  boxShadow:'0 0 0 4px #22c55e'
+                }} />
+                Commande &lt; 90 jours (halo vert)
+                <input type="checkbox" checked={fRecent} onChange={e=>setFRecent(e.target.checked)} style={{marginLeft:8}} />
+              </div>
+
+              <div>
+                <span style={{
+                  display:'inline-block', width:14, height:14, borderRadius:999,
+                  background:'#e11d48', border:'1px solid rgba(0,0,0,.35)', marginRight:6,
+                  boxShadow:'0 0 0 4px #9ca3af'
+                }} />
+                Inactif &gt; 2 ans (halo gris)
+                <input type="checkbox" checked={fStale} onChange={e=>setFStale(e.target.checked)} style={{marginLeft:8}} />
+              </div>
+
+              <div>
+                <span style={{position:'relative', display:'inline-block', width:14, height:14, borderRadius:999,
+                  background:'#e11d48', border:'1px solid rgba(0,0,0,.35)', marginRight:6}}>
+                  <span style={{position:'absolute', left:'50%', top:'50%', width:6, height:6, marginLeft:-3, marginTop:-3, borderRadius:999, background:'#3b82f6'}} />
+                </span>
+                Jamais commandé (point bleu)
+                <input type="checkbox" checked={fNever} onChange={e=>setFNever(e.target.checked)} style={{marginLeft:8}} />
+              </div>
+
+              <div>
+                <span style={{
+                  display:'inline-block', width:14, height:14, borderRadius:999,
+                  background:'#e11d48', border:'1px solid rgba(0,0,0,.35)', marginRight:6
+                }} />
+                Autres (entre 90 j et 2 ans)
+                <input type="checkbox" checked={fNormal} onChange={e=>setFNormal(e.target.checked)} style={{marginLeft:8}} />
+              </div>
+            </div>
           </div>
+        </div>
+
+        {/* Statut & progression */}
+        <div style={{ marginTop: 10, fontSize: 13, color: '#444' }}>
+          {loading
+            ? 'Chargement des revendeurs…'
+            : `Revendeurs: ${enriched.length} | Affichés (selon filtres): ${filtered.length}`}
+
+          {progress.total > 0 && (
+            <>
+              <div style={{ marginTop: 6, width: 360, height: 6, background: '#eee', borderRadius: 4 }}>
+                <div
+                  style={{
+                    width: `${progress.total ? Math.round((progress.done / progress.total) * 100) : 0}%`,
+                    height: '100%', borderRadius: 4, background: '#60a5fa'
+                  }}
+                />
+              </div>
+              <div style={{ marginTop: 6, fontSize: 12 }}>
+                Géocode OK: <b>{okCount}</b> — Échecs: <b>{failCount}</b>
+                {lastError && <span style={{ color: '#b91c1c' }}> • Dernière erreur: {lastError}</span>}
+              </div>
+              <div style={{ marginTop: 4, fontSize: 12, opacity: .8 }}>
+                Astuce: après le premier chargement, c’est instantané grâce au cache local.
+              </div>
+            </>
+          )}
         </div>
       </div>
 
