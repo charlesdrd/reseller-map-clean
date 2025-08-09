@@ -3,27 +3,16 @@ import Head from 'next/head';
 
 type Customer = {
   name: string;
-  address: string;
-  addressSource: 'custom' | 'default'; // 'default' = on utilise l'adresse principale (non confirmée)
+  address: string;                 // adresse finale (custom.address ou adresse principale)
+  addressSource: 'custom' | 'default';
   lastOrderAt: string | null;
-  wholesale: boolean; // validé si true
+  wholesale: boolean;              // true si profil wholesale rempli
+  tags?: string[];                 // pour filtrer "wls"
   lat?: number;
   lng?: number;
-  dist?: number;
 };
 
-const DEFAULT_RADIUS_KM = 1;
-
-function haversineKm(a: { lat: number; lng: number }, b: { lat: number; lng: number }) {
-  const toRad = (d: number) => (d * Math.PI) / 180;
-  const R = 6371;
-  const dLat = toRad(b.lat - a.lat);
-  const dLng = toRad(b.lng - a.lng);
-  const s =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(s));
-}
+const DEFAULT_CENTER: [number, number] = [48.8566, 2.3522]; // Paris
 
 function isInactive(lastOrderAt: string | null): boolean {
   const twoYearsAgo = new Date();
@@ -31,43 +20,24 @@ function isInactive(lastOrderAt: string | null): boolean {
   return !lastOrderAt || new Date(lastOrderAt) < twoYearsAgo;
 }
 
-/** Icône Leaflet :
- * - validé + adresse par défaut -> ORANGE plein
- * - non validé + adresse par défaut -> BICOLORE ORANGE+GRIS
- * - adresse confirmée (custom) -> ROUGE
- * - inactif (>2 ans) -> halo gris
- */
-function makeIcon(
-  L: any,
-  opts: {
-    usingDefault: boolean;
-    validated: boolean;
-    inactive: boolean;
-  }
-) {
+function makeIcon(L: any, kind: 'red' | 'redWhite' | 'orange' | 'grey') {
   const size = 18;
-  let bg = '#ef4444'; // rouge
-  let gradient = '';
-
-  if (opts.usingDefault) {
-    if (opts.validated) {
-      bg = '#f59e0b'; // orange
-    } else {
-      gradient = 'linear-gradient(90deg, #f59e0b 50%, #9ca3af 50%)'; // orange+gris
-      bg = 'transparent';
-    }
+  let style = '';
+  if (kind === 'red') {
+    style = `background:#ef4444;`;
+  } else if (kind === 'redWhite') {
+    style = `background:linear-gradient(90deg,#ef4444 50%, #ffffff 50%);`;
+  } else if (kind === 'orange') {
+    style = `background:#f59e0b;`;
+  } else {
+    // grey
+    style = `background:#d1d5db;`;
   }
-
-  const halo = opts.inactive ? '0 0 0 3px #9ca3af' : '0 0 0 0 transparent';
-
   const html = `<div style="
       width:${size}px;height:${size}px;border-radius:50%;
-      background:${bg};
-      ${gradient ? `background:${gradient};` : ''}
+      ${style}
       border:1px solid rgba(0,0,0,0.35);
-      box-shadow:${halo};
     "></div>`;
-
   return L.divIcon({
     html,
     className: 'reseller-pin',
@@ -80,35 +50,40 @@ export default function MapPage() {
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // debug & progression
+  // progression & debug
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [okCount, setOkCount] = useState(0);
   const [failCount, setFailCount] = useState(0);
   const [lastError, setLastError] = useState<string>('');
 
-  const [radius, setRadius] = useState(DEFAULT_RADIUS_KM);
-  const [candidate, setCandidate] = useState('');
-  const [nearby, setNearby] = useState<Customer[]>([]);
+  // filtres d’affichage
+  const [showRed, setShowRed] = useState(true);
+  const [showRedWhite, setShowRedWhite] = useState(true);
+  const [showOrange, setShowOrange] = useState(true);
+  const [showGrey, setShowGrey] = useState(true);
+
+  // recherche
+  const [search, setSearch] = useState('');
+
   const mapRef = useRef<any>(null);
-  const circleRef = useRef<any>(null);
   const markersRef = useRef<any[]>([]);
 
-  // init map
+  // init carte
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const L = require('leaflet');
-    const m = L.map('map').setView([48.8566, 2.3522], 5);
+    const m = L.map('map').setView(DEFAULT_CENTER, 5);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(m);
     mapRef.current = m;
     return () => m.remove();
   }, []);
 
-  // charge clients + géocode 1 par 1 (évite timeouts vercel)
+  // charger clients + filtrer tag wls + géocoder 1 par 1
   useEffect(() => {
     (async () => {
       const key = new URLSearchParams(window.location.search).get('key') || '';
 
-      // 1) charge les clients
+      // 1) clients
       const r = await fetch(`/api/customers?key=${encodeURIComponent(key)}`);
       const baseJson = await r.json().catch(() => null);
       if (!Array.isArray(baseJson)) {
@@ -116,13 +91,18 @@ export default function MapPage() {
         setLoading(false);
         return;
       }
-      const base = baseJson as Customer[];
-      setProgress({ done: 0, total: base.length });
 
-      // 2) géocode 1 par 1 (pause ~1.1s pour OpenCage)
-      for (let i = 0; i < base.length; i++) {
-        const b = base[i];
+      // Filtre "wls" (insensible à la casse). Si pas de tags, on ignore (au cas où filtré côté serveur).
+      const raw: Customer[] = (baseJson as Customer[]).filter((c) => {
+        const tags = (c.tags || []).map((t) => t.toLowerCase());
+        return tags.includes('wls');
+      });
 
+      setProgress({ done: 0, total: raw.length });
+
+      // 2) géocode séquentiel
+      for (let i = 0; i < raw.length; i++) {
+        const b = raw[i];
         try {
           const g = await fetch(`/api/geocode?key=${encodeURIComponent(key)}`, {
             method: 'POST',
@@ -159,22 +139,37 @@ export default function MapPage() {
           setLastError(`exception: ${e?.message || 'unknown'}`);
         }
 
-        setProgress({ done: i + 1, total: base.length });
-
-        // montrer dès le 1er point
+        setProgress({ done: i + 1, total: raw.length });
         if (i === 0) setLoading(false);
-
-        // respecte OpenCage (~1 req/s)
-        await new Promise((rr) => setTimeout(rr, 1100));
+        await new Promise((rr) => setTimeout(rr, 1100)); // ~1 req/s
       }
     })();
   }, []);
 
-  // dessine les marqueurs
+  // Catégories (priorité ORANGE > ROUGE/ROUGE&BLANC ; GRIS si wholesale non rempli)
+  type Cat = 'red' | 'redWhite' | 'orange' | 'grey' | null;
+  function getCategory(c: Customer): Cat {
+    const validWholesale = !!c.wholesale;
+    const hasCustom = c.addressSource === 'custom';
+    const inactive = isInactive(c.lastOrderAt);
+
+    // 4) gris : wholesale non rempli
+    if (!validWholesale) return 'grey';
+
+    // 3) orange : wholesale rempli + inactif (prioritaire)
+    if (inactive) return 'orange';
+
+    // 1) rouge : custom.address + wholesale rempli
+    if (hasCustom) return 'red';
+
+    // 2) rouge&blanc : pas de custom.address (adresse par défaut) + wholesale rempli
+    return 'redWhite';
+  }
+
+  // dessiner selon filtres
   useEffect(() => {
     if (!mapRef.current) return;
 
-    // clear old
     markersRef.current.forEach((m) => m.remove());
     markersRef.current = [];
 
@@ -187,140 +182,147 @@ export default function MapPage() {
         typeof c.lng !== 'number' ||
         Number.isNaN(c.lat) ||
         Number.isNaN(c.lng)
-      ) {
+      )
         continue;
-      }
 
-      const icon = makeIcon(L, {
-        usingDefault: c.addressSource === 'default',
-        validated: !!c.wholesale,
-        inactive: isInactive(c.lastOrderAt),
-      });
+      const cat = getCategory(c);
+      if (!cat) continue;
 
+      if (cat === 'red' && !showRed) continue;
+      if (cat === 'redWhite' && !showRedWhite) continue;
+      if (cat === 'orange' && !showOrange) continue;
+      if (cat === 'grey' && !showGrey) continue;
+
+      const icon = makeIcon(L, cat);
       const marker = L.marker([c.lat, c.lng], { icon });
-      marker.bindPopup(
-        `<b>${c.name}</b><br>${c.address}` +
-          (c.lastOrderAt
-            ? `<br>Dernière commande : ${new Date(c.lastOrderAt).toLocaleDateString()}`
-            : `<br>Jamais commandé`) +
-          (c.addressSource === 'default'
-            ? `<br><i>Adresse non confirmée (adresse principale Shopify)</i>`
-            : '') +
-          (!c.wholesale ? `<br><i>Profil wholesale non validé</i>` : '')
-      );
+
+      const lines: string[] = [];
+      lines.push(`<b>${c.name}</b>`);
+      lines.push(c.address);
+      lines.push(c.wholesale ? 'Profil wholesale : <b>rempli</b>' : 'Profil wholesale : <b>non rempli</b>');
+      if (c.addressSource === 'custom') {
+        lines.push('<i>Adresse de revente (custom.address)</i>');
+      } else {
+        lines.push('<i>Adresse de revente non vérifiée (adresse principale)</i>');
+      }
+      if (c.lastOrderAt) lines.push(`Dernière commande : ${new Date(c.lastOrderAt).toLocaleDateString()}`);
+
+      marker.bindPopup(lines.join('<br/>'));
       marker.addTo(mapRef.current);
       markersRef.current.push(marker);
     }
-  }, [customers]);
+  }, [customers, showRed, showRedWhite, showOrange, showGrey]);
 
-  async function checkCandidate() {
+  // recherche d’adresse
+  async function searchAddress() {
     const key = new URLSearchParams(window.location.search).get('key') || '';
+    const q = search.trim();
+    if (!q) return;
+
     const r = await fetch(`/api/geocode?key=${encodeURIComponent(key)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ address: candidate }),
+      body: JSON.stringify({ address: q }),
     });
     if (!r.ok) {
       alert('Adresse introuvable');
       return;
     }
     const pt: any = await r.json().catch(() => null);
-    if (
-      !pt ||
-      typeof pt.lat !== 'number' ||
-      typeof pt.lng !== 'number' ||
-      Number.isNaN(pt.lat) ||
-      Number.isNaN(pt.lng)
-    ) {
+    if (!pt || typeof pt.lat !== 'number' || typeof pt.lng !== 'number') {
       alert('Adresse introuvable');
       return;
     }
-
-    const L = require('leaflet');
-    if (circleRef.current) {
-      circleRef.current.remove();
-      circleRef.current = null;
-    }
-    circleRef.current = L.circle([pt.lat, pt.lng], { radius: radius * 1000 }).addTo(mapRef.current);
     mapRef.current.setView([pt.lat, pt.lng], 13);
-
-    const hits = customers
-      .filter(
-        (c) =>
-          typeof c.lat === 'number' &&
-          typeof c.lng === 'number' &&
-          !Number.isNaN(c.lat) &&
-          !Number.isNaN(c.lng)
-      )
-      .map((c) => ({
-        ...c,
-        dist: haversineKm({ lat: pt.lat, lng: pt.lng }, { lat: c.lat!, lng: c.lng! }),
-      }))
-      .filter((c) => (c.dist as number) <= radius)
-      .sort((a, b) => (a.dist as number) - (b.dist as number));
-
-    setNearby(hits);
   }
 
   const Legend = () => (
-    <div style={{ display: 'flex', gap: 12, marginTop: 6, fontSize: 12, flexWrap: 'wrap' }}>
-      <span>
-        <i
-          style={{
-            display: 'inline-block',
-            width: 12,
-            height: 12,
-            borderRadius: 999,
-            background: '#ef4444',
-            border: '1px solid rgba(0,0,0,0.35)',
-            marginRight: 6,
-          }}
-        />
-        Adresse confirmée (custom.address)
-      </span>
-      <span>
-        <i
-          style={{
-            display: 'inline-block',
-            width: 12,
-            height: 12,
-            borderRadius: 999,
-            background: '#f59e0b',
-            border: '1px solid rgba(0,0,0,0.35)',
-            marginRight: 6,
-          }}
-        />
-        Validé — <b>Adresse non confirmée</b> (adresse principale)
-      </span>
-      <span>
-        <i
-          style={{
-            display: 'inline-block',
-            width: 12,
-            height: 12,
-            borderRadius: 999,
-            background: 'linear-gradient(90deg, #f59e0b 50%, #9ca3af 50%)',
-            border: '1px solid rgba(0,0,0,0.35)',
-            marginRight: 6,
-          }}
-        />
-        Non validé — <b>Adresse non confirmée</b> (adresse principale)
-      </span>
-      <span>
-        <i
-          style={{
-            display: 'inline-block',
-            width: 12,
-            height: 12,
-            borderRadius: 999,
-            background: '#fff',
-            border: '1px solid rgba(0,0,0,0.35)',
-            boxShadow: '0 0 0 3px #9ca3af',
-            marginRight: 6,
-          }}
-        />
-        Halo gris : pas de commande depuis + de 2 ans
-      </span>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+      <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: 13 }}>
+        <span>
+          <i
+            style={{
+              display: 'inline-block',
+              width: 12,
+              height: 12,
+              borderRadius: 999,
+              background: '#ef4444',
+              border: '1px solid rgba(0,0,0,0.35)',
+              marginRight: 6,
+            }}
+          />
+          Revendeurs validés
+        </span>
+        <span>
+          <i
+            style={{
+              display: 'inline-block',
+              width: 12,
+              height: 12,
+              borderRadius: 999,
+              background: 'linear-gradient(90deg,#ef4444 50%, #ffffff 50%)',
+              border: '1px solid rgba(0,0,0,0.35)',
+              marginRight: 6,
+            }}
+          />
+          Revendeurs validés (adresse de revente non vérifiée)
+        </span>
+        <span>
+          <i
+            style={{
+              display: 'inline-block',
+              width: 12,
+              height: 12,
+              borderRadius: 999,
+              background: '#f59e0b',
+              border: '1px solid rgba(0,0,0,0.35)',
+              marginRight: 6,
+            }}
+          />
+          Pas de commande depuis + de 2 ans
+        </span>
+        <span>
+          <i
+            style={{
+              display: 'inline-block',
+              width: 12,
+              height: 12,
+              borderRadius: 999,
+              background: '#d1d5db',
+              border: '1px solid rgba(0,0,0,0.35)',
+              marginRight: 6,
+            }}
+          />
+          Revendeurs non validés
+        </span>
+      </div>
+
+      <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+        <label>
+          <input type="checkbox" checked={showRed} onChange={(e) => setShowRed(e.target.checked)} /> Afficher
+          rouges
+        </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={showRedWhite}
+            onChange={(e) => setShowRedWhite(e.target.checked)}
+          />{' '}
+          Afficher rouge & blanc
+        </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={showOrange}
+            onChange={(e) => setShowOrange(e.target.checked)}
+          />{' '}
+          Afficher orange
+        </label>
+        <label>
+          <input type="checkbox" checked={showGrey} onChange={(e) => setShowGrey(e.target.checked)} /> Afficher
+          gris clair
+        </label>
+      </div>
     </div>
   );
 
@@ -341,55 +343,33 @@ export default function MapPage() {
           padding: 10,
           borderRadius: 8,
           boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+          maxWidth: 720,
         }}
       >
+        {/* Recherche */}
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
           <input
-            value={candidate}
-            onChange={(e) => setCandidate(e.target.value)}
-            placeholder="Nouvelle adresse client"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Rechercher une adresse…"
             style={{ padding: 8, width: 320 }}
           />
-          <label>
-            Rayon (km):{' '}
-            <input
-              type="number"
-              min={0.1}
-              step={0.1}
-              value={radius}
-              onChange={(e) => setRadius(parseFloat(e.target.value))}
-              style={{ width: 80, padding: 6 }}
-            />
-          </label>
-          <button onClick={checkCandidate} style={{ padding: '8px 12px' }}>
-            Vérifier proximité
+          <button onClick={searchAddress} style={{ padding: '8px 12px' }}>
+            Rechercher
           </button>
         </div>
 
-        <div style={{ marginTop: 8, maxWidth: 560 }}>
-          {loading
-            ? `Chargement… (${progress.done}/${progress.total})`
-            : nearby.length
-            ? (
-              <div>
-                <b>{nearby.length} revendeur(s) dans {radius} km :</b>
-                <ul>
-                  {nearby.map((h, i) => (
-                    <li key={i}>
-                      {h.dist!.toFixed(2)} km — <b>{h.name}</b> — {h.address}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )
-            : 'Aucun revendeur proche pour l’instant.'}
-
+        {/* Chargement / Debug */}
+        <div style={{ marginTop: 8 }}>
+          {loading ? `Chargement… (${progress.done}/${progress.total})` : null}
           {progress.total > 0 && (
             <>
               <div style={{ marginTop: 6, width: 280, height: 6, background: '#eee', borderRadius: 4 }}>
                 <div
                   style={{
-                    width: `${progress.total ? Math.round((progress.done / progress.total) * 100) : 0}%`,
+                    width: `${
+                      progress.total ? Math.round((progress.done / progress.total) * 100) : 0
+                    }%`,
                     height: '100%',
                     borderRadius: 4,
                     background: '#60a5fa',
@@ -398,11 +378,7 @@ export default function MapPage() {
               </div>
               <div style={{ marginTop: 6, fontSize: 12, color: '#444' }}>
                 OK: <b>{okCount}</b> — Échecs: <b>{failCount}</b>
-                {lastError && (
-                  <div style={{ marginTop: 4, color: '#b91c1c' }}>
-                    Dernière erreur: {lastError}
-                  </div>
-                )}
+                {lastError && <div style={{ marginTop: 4, color: '#b91c1c' }}>Dernière erreur: {lastError}</div>}
               </div>
             </>
           )}
