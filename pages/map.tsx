@@ -17,8 +17,8 @@ const DEFAULT_RADIUS_KM = 1;
 function haversineKm(a: { lat: number; lng: number }, b: { lat: number; lng: number }) {
   const toRad = (d: number) => (d * Math.PI) / 180;
   const R = 6371;
-  const dLat = toRad(b.lat - a.lat),
-    dLng = toRad(b.lng - a.lng);
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
   const s =
     Math.sin(dLat / 2) ** 2 +
     Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
@@ -31,11 +31,11 @@ function isInactive(lastOrderAt: string | null): boolean {
   return !lastOrderAt || new Date(lastOrderAt) < twoYearsAgo;
 }
 
-/** Crée un DivIcon Leaflet avec styles:
+/** Icône Leaflet :
  * - validé + adresse par défaut -> ORANGE plein
- * - non validé + adresse par défaut -> BICOLORE ORANGE+GRIS (moitié-moitié)
+ * - non validé + adresse par défaut -> BICOLORE ORANGE+GRIS
  * - adresse confirmée (custom) -> ROUGE
- * - si inactif (>2 ans): on ajoute un HALO gris
+ * - inactif (>2 ans) -> halo gris
  */
 function makeIcon(
   L: any,
@@ -46,16 +46,14 @@ function makeIcon(
   }
 ) {
   const size = 18;
-  let bg = '#ef4444'; // rouge par défaut (adresse confirmée)
+  let bg = '#ef4444'; // rouge
   let gradient = '';
 
   if (opts.usingDefault) {
     if (opts.validated) {
-      // orange plein
-      bg = '#f59e0b';
+      bg = '#f59e0b'; // orange
     } else {
-      // bicolore orange + gris
-      gradient = 'linear-gradient(90deg, #f59e0b 50%, #9ca3af 50%)';
+      gradient = 'linear-gradient(90deg, #f59e0b 50%, #9ca3af 50%)'; // orange+gris
       bg = 'transparent';
     }
   }
@@ -81,7 +79,13 @@ function makeIcon(
 export default function MapPage() {
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [loading, setLoading] = useState(true);
+
+  // debug & progression
   const [progress, setProgress] = useState({ done: 0, total: 0 });
+  const [okCount, setOkCount] = useState(0);
+  const [failCount, setFailCount] = useState(0);
+  const [lastError, setLastError] = useState<string>('');
+
   const [radius, setRadius] = useState(DEFAULT_RADIUS_KM);
   const [candidate, setCandidate] = useState('');
   const [nearby, setNearby] = useState<Customer[]>([]);
@@ -99,7 +103,7 @@ export default function MapPage() {
     return () => m.remove();
   }, []);
 
-  // load customers + geocode 1-by-1 (évite les timeouts)
+  // charge clients + géocode 1 par 1 (évite timeouts vercel)
   useEffect(() => {
     (async () => {
       const key = new URLSearchParams(window.location.search).get('key') || '';
@@ -108,14 +112,14 @@ export default function MapPage() {
       const r = await fetch(`/api/customers?key=${encodeURIComponent(key)}`);
       const baseJson = await r.json().catch(() => null);
       if (!Array.isArray(baseJson)) {
-        console.error('customers API error:', baseJson);
+        setLastError('Erreur /api/customers (réponse non JSON array)');
         setLoading(false);
         return;
       }
       const base = baseJson as Customer[];
       setProgress({ done: 0, total: base.length });
 
-      // 2) géocode 1 par 1 (avec pause ~1.1s pour OpenCage)
+      // 2) géocode 1 par 1 (pause ~1.1s pour OpenCage)
       for (let i = 0; i < base.length; i++) {
         const b = base[i];
 
@@ -126,7 +130,10 @@ export default function MapPage() {
             body: JSON.stringify({ address: b.address }),
           });
 
-          if (g.ok) {
+          if (!g.ok) {
+            setFailCount((v) => v + 1);
+            setLastError(`geocode ${g.status} ${g.statusText}`);
+          } else {
             const c: any = await g.json().catch(() => null);
             const ok =
               c &&
@@ -136,29 +143,34 @@ export default function MapPage() {
               !Number.isNaN(c.lng);
 
             if (ok) {
+              setOkCount((v) => v + 1);
               setCustomers((prev) => {
                 const byKey = new Map(prev.map((p) => [`${p.name}|${p.address}`, p]));
                 byKey.set(`${b.name}|${b.address}`, { ...b, lat: c.lat, lng: c.lng });
                 return Array.from(byKey.values());
               });
+            } else {
+              setFailCount((v) => v + 1);
+              setLastError('geocode ok mais coords invalides');
             }
           }
-        } catch {
-          // on continue
+        } catch (e: any) {
+          setFailCount((v) => v + 1);
+          setLastError(`exception: ${e?.message || 'unknown'}`);
         }
 
         setProgress({ done: i + 1, total: base.length });
 
-        // montre dès le 1er point
+        // montrer dès le 1er point
         if (i === 0) setLoading(false);
 
-        // respecte la limite OpenCage (~1 req/s)
+        // respecte OpenCage (~1 req/s)
         await new Promise((rr) => setTimeout(rr, 1100));
       }
     })();
   }, []);
 
-  // draw markers with our icon rules
+  // dessine les marqueurs
   useEffect(() => {
     if (!mapRef.current) return;
 
@@ -176,7 +188,7 @@ export default function MapPage() {
         Number.isNaN(c.lat) ||
         Number.isNaN(c.lng)
       ) {
-        continue; // ignore toute entrée sans coords valides
+        continue;
       }
 
       const icon = makeIcon(L, {
@@ -250,7 +262,6 @@ export default function MapPage() {
     setNearby(hits);
   }
 
-  // Légende
   const Legend = () => (
     <div style={{ display: 'flex', gap: 12, marginTop: 6, fontSize: 12, flexWrap: 'wrap' }}>
       <span>
@@ -372,19 +383,28 @@ export default function MapPage() {
               </div>
             )
             : 'Aucun revendeur proche pour l’instant.'}
+
           {progress.total > 0 && (
-            <div style={{ marginTop: 6, width: 280, height: 6, background: '#eee', borderRadius: 4 }}>
-              <div
-                style={{
-                  width: `${
-                    progress.total ? Math.round((progress.done / progress.total) * 100) : 0
-                  }%`,
-                  height: '100%',
-                  borderRadius: 4,
-                  background: '#60a5fa',
-                }}
-              />
-            </div>
+            <>
+              <div style={{ marginTop: 6, width: 280, height: 6, background: '#eee', borderRadius: 4 }}>
+                <div
+                  style={{
+                    width: `${progress.total ? Math.round((progress.done / progress.total) * 100) : 0}%`,
+                    height: '100%',
+                    borderRadius: 4,
+                    background: '#60a5fa',
+                  }}
+                />
+              </div>
+              <div style={{ marginTop: 6, fontSize: 12, color: '#444' }}>
+                OK: <b>{okCount}</b> — Échecs: <b>{failCount}</b>
+                {lastError && (
+                  <div style={{ marginTop: 4, color: '#b91c1c' }}>
+                    Dernière erreur: {lastError}
+                  </div>
+                )}
+              </div>
+            </>
           )}
         </div>
 
