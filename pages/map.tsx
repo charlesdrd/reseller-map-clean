@@ -15,6 +15,7 @@ type Customer = {
 const DEFAULT_CENTER: [number, number] = [48.8566, 2.3522];
 const CACHE_KEY = 'geoCache.v1';
 
+// ------ cache helpers ------
 function loadGeoCache(): Record<string, { lat: number; lng: number }> {
   if (typeof window === 'undefined') return {};
   try {
@@ -33,6 +34,7 @@ function clearGeoCache() {
   localStorage.removeItem(CACHE_KEY);
 }
 
+// ------ activity helpers ------
 function daysSince(d: Date) {
   const ms = Date.now() - d.getTime();
   return Math.floor(ms / (1000 * 60 * 60 * 24));
@@ -48,15 +50,19 @@ function classifyActivity(lastOrderAt: string | null): Activity {
   return 'normal';
 }
 
-// markers
+// ------ marker icon ------
+// Base color = adresse (fiabilité)
+//   - confirmed: rouge vif (#e11d48)
+//   - default:   rouge clair (#f87171)
+// Overlays = activité (se superpose):
+//   - halo vert  = recent (<90j)
+//   - halo gris  = stale (>2 ans)
+//   - dot bleu   = never
 function makeIcon(L: any, opts: { confirmed: boolean; activity: Activity }) {
   const size = 18;
 
-  const baseStyle = opts.confirmed
-    ? `background:#e11d48;`
-    : `background:#fde2e2;border:2px solid #e11d48;box-sizing:border-box;`;
+  const baseBg = opts.confirmed ? '#e11d48' : '#f87171';
 
-  // priority: stale > recent > none
   let halo = '';
   if (opts.activity === 'stale') halo = '0 0 0 4px #9ca3af';
   else if (opts.activity === 'recent') halo = '0 0 0 4px #22c55e';
@@ -70,7 +76,7 @@ function makeIcon(L: any, opts: { confirmed: boolean; activity: Activity }) {
     <div style="
       position:relative;
       width:${size}px;height:${size}px;border-radius:50%;
-      ${baseStyle}
+      background:${baseBg};
       border:1px solid rgba(0,0,0,.35);
       box-shadow:${halo || 'none'};
     ">
@@ -89,12 +95,13 @@ export default function MapPage() {
   const [allCustomers, setAllCustomers] = useState<Customer[]>([]);
   const [loading, setLoading] = useState(true);
 
+  // géocode progression
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [okCount, setOkCount] = useState(0);
   const [failCount, setFailCount] = useState(0);
   const [lastError, setLastError] = useState<string>('');
 
-  // filters
+  // filtres
   const [fRecent, setFRecent] = useState(true);
   const [fStale, setFStale] = useState(true);
   const [fNever, setFNever] = useState(true);
@@ -104,12 +111,10 @@ export default function MapPage() {
   const [fDefault, setFDefault] = useState(true);
 
   const [search, setSearch] = useState('');
-
   const mapRef = useRef<any>(null);
-  const markersRef = useRef<Array<{ marker: any; customer: Customer; activity: Activity; confirmed: boolean }>>(
-    []
-  );
+  const markersRef = useRef<Array<{ marker: any; customer: Customer; activity: Activity; confirmed: boolean }>>([]);
 
+  // init map
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const L = require('leaflet');
@@ -119,6 +124,7 @@ export default function MapPage() {
     return () => m.remove();
   }, []);
 
+  // fetch customers (wholesale défini + adresse dispo)
   async function fetchCustomers() {
     setLoading(true);
     setLastError('');
@@ -145,9 +151,9 @@ export default function MapPage() {
       setLoading(false);
     }
   }
-
   useEffect(() => { fetchCustomers(); }, []);
 
+  // enrich
   const enriched = useMemo(() => {
     return allCustomers.map((c) => ({
       ...c,
@@ -156,6 +162,7 @@ export default function MapPage() {
     }));
   }, [allCustomers]);
 
+  // filtres mémoire
   const filtered = useMemo(() => {
     return enriched.filter((c) => {
       if (!fRecent && c.activity === 'recent') return false;
@@ -168,6 +175,7 @@ export default function MapPage() {
     });
   }, [enriched, fRecent, fStale, fNever, fNormal, fConfirmed, fDefault]);
 
+  // géocode + markers
   useEffect(() => {
     if (!mapRef.current) return;
 
@@ -180,8 +188,8 @@ export default function MapPage() {
     }
 
     const L = require('leaflet');
-
     let cancelled = false;
+
     (async () => {
       const key = new URLSearchParams(window.location.search).get('key') || '';
       const cache = loadGeoCache();
@@ -195,7 +203,6 @@ export default function MapPage() {
       const geocodeOne = async (addr: string) => {
         if (cancelled) return null;
         if (cache[addr]) return cache[addr];
-
         try {
           const g = await fetch(`/api/geocode?key=${encodeURIComponent(key)}`, {
             method: 'POST',
@@ -228,10 +235,10 @@ export default function MapPage() {
         }
       };
 
+      // parallélisme limité
       const CONCURRENCY = 3;
       const idxRef = { i: 0 };
       const results: Record<string, { lat: number; lng: number } | null> = {};
-
       async function worker() {
         while (!cancelled && idxRef.i < addrs.length) {
           const addr = addrs[idxRef.i++];
@@ -277,6 +284,7 @@ export default function MapPage() {
     return () => { cancelled = true; };
   }, [enriched]);
 
+  // appliquer filtres sans régéocoder
   useEffect(() => {
     if (!mapRef.current) return;
     for (const item of markersRef.current) {
@@ -288,13 +296,13 @@ export default function MapPage() {
         (a === 'normal' && fNormal);
 
       const showSource = (item.confirmed && fConfirmed) || (!item.confirmed && fDefault);
-
       const visible = showActivity && showSource;
       const el = (item.marker as any)?._icon as HTMLElement | undefined;
       if (el) el.style.display = visible ? 'block' : 'none';
     }
   }, [fRecent, fStale, fNever, fNormal, fConfirmed, fDefault]);
 
+  // recherche adresse = recadrage
   async function searchAddress() {
     const key = new URLSearchParams(window.location.search).get('key') || '';
     const q = search.trim();
@@ -338,7 +346,7 @@ export default function MapPage() {
           maxWidth: 920,
         }}
       >
-        {/* search + reload */}
+        {/* Recherche + reload */}
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
           <input
             value={search}
@@ -350,11 +358,11 @@ export default function MapPage() {
           <button onClick={manualReload} style={{ padding: '8px 12px' }}>Recharger les données</button>
         </div>
 
-        {/* 2 sections: Adresse (base) / Activité (overlays) */}
+        {/* Légende: Adresse (couleur de base) + Activité (overlays) */}
         <div style={{ marginTop: 12, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
           {/* Adresse */}
           <div>
-            <div style={{ fontWeight: 700, marginBottom: 6 }}>Adresse</div>
+            <div style={{ fontWeight: 700, marginBottom: 6 }}>Adresse (couleur du point)</div>
             <div style={{ lineHeight: 1.8 }}>
               <div>
                 <span style={{
@@ -367,8 +375,7 @@ export default function MapPage() {
               <div>
                 <span style={{
                   display:'inline-block', width:14, height:14, borderRadius:999,
-                  background:'#fde2e2', border:'2px solid #e11d48', boxSizing:'border-box',
-                  marginRight:6
+                  background:'#f87171', border:'1px solid rgba(0,0,0,.35)', marginRight:6
                 }} />
                 Non confirmée (adresse par défaut)
                 <input type="checkbox" checked={fDefault} onChange={e=>setFDefault(e.target.checked)} style={{marginLeft:8}} />
@@ -378,7 +385,7 @@ export default function MapPage() {
 
           {/* Activité */}
           <div>
-            <div style={{ fontWeight: 700, marginBottom: 6 }}>Activité (se superpose à la couleur de l’adresse)</div>
+            <div style={{ fontWeight: 700, marginBottom: 6 }}>Activité (se superpose à la couleur)</div>
             <div style={{ lineHeight: 1.8 }}>
               <div>
                 <span style={{
@@ -416,7 +423,7 @@ export default function MapPage() {
           </div>
         </div>
 
-        {/* status */}
+        {/* Statut & progression */}
         <div style={{ marginTop: 10, fontSize: 13, color: '#444' }}>
           {loading
             ? 'Chargement des revendeurs…'
